@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -19,132 +19,193 @@ type testPayload struct {
 }
 
 func TestWebhookHandler(t *testing.T) {
-	os.Setenv("WEBHOOK_ENABLED_STREAMKEYS", "token1:streamkey1,token2:streamkey2")
+	tokenToStreamKey := parseStreamKeys("token1:streamkey1,token2:streamkey2")
+	handler := webhookHandler(tokenToStreamKey)
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Error(w, "Only POST method is accepted", http.StatusMethodNotAllowed)
-			return
-		}
+	tests := []struct {
+		name          string
+		payload       testPayload
+		wantStatus    int
+		wantStreamKey string
+	}{
+		{
+			name: "whip-connect: valid token",
+			payload: testPayload{
+				Action:      "whip-connect",
+				IP:          "127.0.0.1",
+				BearerToken: "token1",
+				QueryParams: map[string]string{},
+				UserAgent:   "test-agent",
+			},
+			wantStatus:    http.StatusOK,
+			wantStreamKey: "streamkey1",
+		},
+		{
+			name: "whep-connect: valid streamkey",
+			payload: testPayload{
+				Action:      "whep-connect",
+				IP:          "127.0.0.1",
+				BearerToken: "streamkey2",
+				QueryParams: map[string]string{},
+				UserAgent:   "test-agent",
+			},
+			wantStatus:    http.StatusOK,
+			wantStreamKey: "streamkey2",
+		},
+		{
+			name: "whip-connect: not found",
+			payload: testPayload{
+				Action:      "whip-connect",
+				IP:          "127.0.0.1",
+				BearerToken: "notfound",
+				QueryParams: map[string]string{},
+				UserAgent:   "test-agent",
+			},
+			wantStatus:    http.StatusForbidden,
+			wantStreamKey: "",
+		},
+		{
+			name: "whep-connect: not found",
+			payload: testPayload{
+				Action:      "whep-connect",
+				IP:          "127.0.0.1",
+				BearerToken: "notfound",
+				QueryParams: map[string]string{},
+				UserAgent:   "test-agent",
+			},
+			wantStatus:    http.StatusForbidden,
+			wantStreamKey: "",
+		},
+		{
+			// Public stream names must not be usable as ingest tokens.
+			name: "whip-connect: streamKey rejected as bearerToken",
+			payload: testPayload{
+				Action:      "whip-connect",
+				IP:          "127.0.0.1",
+				BearerToken: "streamkey1",
+				QueryParams: map[string]string{},
+				UserAgent:   "test-agent",
+			},
+			wantStatus:    http.StatusForbidden,
+			wantStreamKey: "",
+		},
+		{
+			// Secret ingest tokens must not authenticate viewers.
+			name: "whep-connect: ingest token rejected as bearerToken",
+			payload: testPayload{
+				Action:      "whep-connect",
+				IP:          "127.0.0.1",
+				BearerToken: "token1",
+				QueryParams: map[string]string{},
+				UserAgent:   "test-agent",
+			},
+			wantStatus:    http.StatusForbidden,
+			wantStreamKey: "",
+		},
+	}
 
-		var payload webhookPayload
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := json.Marshal(tc.payload)
+			req := httptest.NewRequest("POST", "/", bytes.NewReader(body))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
 
-		enabledStreamKeys := os.Getenv("WEBHOOK_ENABLED_STREAMKEYS")
-		tokenToStreamKey := make(map[string]string)
-		if enabledStreamKeys != "" {
-			pairs := strings.Split(enabledStreamKeys, ",")
-			for _, pair := range pairs {
-				pair = strings.TrimSpace(pair)
-				if pair == "" {
-					continue
-				}
-				parts := strings.SplitN(pair, ":", 2)
-				if len(parts) == 2 {
-					bearer := strings.TrimSpace(parts[0])
-					streamKey := strings.TrimSpace(parts[1])
-					tokenToStreamKey[bearer] = streamKey
-				}
+			if rec.Code != tc.wantStatus {
+				t.Errorf("expected status %d, got %d", tc.wantStatus, rec.Code)
 			}
-		}
+			var resp webhookResponse
+			if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+			if resp.StreamKey != tc.wantStreamKey {
+				t.Errorf("expected streamKey '%s', got '%s'", tc.wantStreamKey, resp.StreamKey)
+			}
+		})
+	}
 
-		switch payload.Action {
-		case "whip-connect":
-			streamKey, isValid := tokenToStreamKey[payload.BearerToken]
-			if isValid {
-				w.WriteHeader(http.StatusOK)
-				json.NewEncoder(w).Encode(webhookResponse{StreamKey: streamKey})
-			} else {
-				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(webhookResponse{})
-			}
-		case "whep-connect":
-			found := false
-			for _, v := range tokenToStreamKey {
-				if v == payload.BearerToken {
-					found = true
-					break
-				}
-			}
-			if found {
-				w.WriteHeader(http.StatusOK)
-				json.NewEncoder(w).Encode(webhookResponse{StreamKey: payload.BearerToken})
-			} else {
-				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(webhookResponse{})
-			}
-		default:
-			http.Error(w, "Invalid action", http.StatusBadRequest)
+	t.Run("non-POST method rejected", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("expected status %d, got %d", http.StatusMethodNotAllowed, rec.Code)
 		}
 	})
 
-	// whip-connect: BearerToken as key
-	payload := testPayload{
-		Action:      "whip-connect",
-		IP:          "127.0.0.1",
-		BearerToken: "token1",
-		QueryParams: map[string]string{},
-		UserAgent:   "test-agent",
-	}
-	body, _ := json.Marshal(payload)
-	req := httptest.NewRequest("POST", "/", bytes.NewReader(body))
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Errorf("whip-connect: expected status 200, got %d", rec.Code)
-	}
-	var resp webhookResponse
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("whip-connect: failed to decode response: %v", err)
-	}
-	if resp.StreamKey != "streamkey1" {
-		t.Errorf("whip-connect: expected streamKey 'streamkey1', got '%s'", resp.StreamKey)
+	t.Run("invalid JSON rejected", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/", strings.NewReader("not json"))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("expected status %d, got %d", http.StatusBadRequest, rec.Code)
+		}
+	})
+
+	t.Run("unknown action rejected", func(t *testing.T) {
+		body, _ := json.Marshal(testPayload{
+			Action:      "bogus-action",
+			BearerToken: "token1",
+		})
+		req := httptest.NewRequest("POST", "/", bytes.NewReader(body))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("expected status %d, got %d", http.StatusBadRequest, rec.Code)
+		}
+	})
+}
+
+func TestParseStreamKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want map[string]string
+	}{
+		{
+			name: "empty input",
+			in:   "",
+			want: map[string]string{},
+		},
+		{
+			name: "single pair",
+			in:   "token1:streamkey1",
+			want: map[string]string{"token1": "streamkey1"},
+		},
+		{
+			name: "multiple pairs",
+			in:   "token1:streamkey1,token2:streamkey2",
+			want: map[string]string{"token1": "streamkey1", "token2": "streamkey2"},
+		},
+		{
+			name: "whitespace around pairs is trimmed",
+			in:   "  token1 : streamkey1 , token2:streamkey2  ",
+			want: map[string]string{"token1": "streamkey1", "token2": "streamkey2"},
+		},
+		{
+			name: "trailing comma is ignored",
+			in:   "token1:streamkey1,",
+			want: map[string]string{"token1": "streamkey1"},
+		},
+		{
+			name: "pair without colon is skipped",
+			in:   "token1:streamkey1,malformed",
+			want: map[string]string{"token1": "streamkey1"},
+		},
+		{
+			// SplitN(_, ":", 2) keeps anything past the first colon in the value.
+			name: "second colon kept in stream key",
+			in:   "token1:stream:key:1",
+			want: map[string]string{"token1": "stream:key:1"},
+		},
 	}
 
-	// whep-connect: BearerToken as value (streamKey)
-	payload = testPayload{
-		Action:      "whep-connect",
-		IP:          "127.0.0.1",
-		BearerToken: "streamkey2",
-		QueryParams: map[string]string{},
-		UserAgent:   "test-agent",
-	}
-	body, _ = json.Marshal(payload)
-	req = httptest.NewRequest("POST", "/", bytes.NewReader(body))
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Errorf("whep-connect: expected status 200, got %d", rec.Code)
-	}
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("whep-connect: failed to decode response: %v", err)
-	}
-	if resp.StreamKey != "streamkey2" {
-		t.Errorf("whep-connect: expected streamKey 'streamkey2', got '%s'", resp.StreamKey)
-	}
-
-	// whep-connect: BearerToken not found
-	payload = testPayload{
-		Action:      "whep-connect",
-		IP:          "127.0.0.1",
-		BearerToken: "notfound",
-		QueryParams: map[string]string{},
-		UserAgent:   "test-agent",
-	}
-	body, _ = json.Marshal(payload)
-	req = httptest.NewRequest("POST", "/", bytes.NewReader(body))
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusForbidden {
-		t.Errorf("whep-connect (notfound): expected status 403, got %d", rec.Code)
-	}
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("whep-connect (notfound): failed to decode response: %v", err)
-	}
-	if resp.StreamKey != "" {
-		t.Errorf("whep-connect (notfound): expected empty streamKey, got '%s'", resp.StreamKey)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseStreamKeys(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("parseStreamKeys(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }
